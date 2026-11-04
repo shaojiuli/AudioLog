@@ -49,7 +49,7 @@
 ./gradlew assembleDebug
 ```
 
-APK 会复制到 `apk/音频播放统计_v<版本>.apk`。签名文件 `signing/debug.keystore` 不在仓库里，没有它时请删掉 `app/build.gradle.kts` 里的 `signingConfigs` 一段，使用本机默认的 debug 签名。
+APK 会复制到 `apk/音频播放统计_v<版本>.apk`。也可以直接在 [Releases](https://github.com/shaojiuli/AudioLog/releases) 下载打包好的 APK。签名文件 `signing/debug.keystore` 不在仓库里，没有它时请删掉 `app/build.gradle.kts` 里的 `signingConfigs` 一段，使用本机默认的 debug 签名。
 
 项目路径含中文时需要 `gradle.properties` 里的 `android.overridePathCheck=true`（已包含）。
 
@@ -60,3 +60,7 @@ APK 会复制到 `apk/音频播放统计_v<版本>.apk`。签名文件 `signing/
 3. 正常听歌听书即可
 
 更新内容见 [CHANGELOG.md](CHANGELOG.md)。`tools/audio_monitor.ps1` 可以通过 adb 实时查看手机上哪个应用在发声。
+
+## 许可证
+
+[MIT](LICENSE)
