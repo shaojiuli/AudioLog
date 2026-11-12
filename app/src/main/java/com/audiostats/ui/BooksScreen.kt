@@ -1,8 +1,10 @@
 package com.audiostats.ui
 
 import androidx.compose.animation.animateContentSize
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -14,6 +16,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -33,8 +36,10 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -56,7 +61,7 @@ import java.time.format.DateTimeFormatter
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun BooksPage(mergeMode: Boolean, bottomPadding: Dp) {
+fun BooksPage(mergeMode: Boolean, bottomPadding: Dp, refreshKey: Int = 0) {
     val context = LocalContext.current
     val db = remember { AudioDb.get(context) }
     val scope = rememberCoroutineScope()
@@ -73,7 +78,7 @@ fun BooksPage(mergeMode: Boolean, bottomPadding: Dp) {
         onPauseOrDispose { }
     }
 
-    LaunchedEffect(reloadTick) {
+    LaunchedEffect(reloadTick, refreshKey) {
         while (true) {
             books = withContext(Dispatchers.IO) { Books.load(db) }
             delay(30_000)
@@ -131,10 +136,15 @@ fun BooksPage(mergeMode: Boolean, bottomPadding: Dp) {
             }
         }
 
-        val sorted = if (sortByTotal) list.sortedByDescending { it.totalMs } else list.sortedByDescending { it.lastMs }
+        val byTotal = list.sortedWith(compareByDescending<Book> { it.totalMs }.thenBy { it.name })
+        val ranks = byTotal.mapIndexed { index, book -> book.name to index + 1 }.toMap()
+        val sorted = if (sortByTotal) byTotal else list.sortedByDescending { it.lastMs }
+        val maxMs = list.maxOfOrNull { it.totalMs } ?: 0L
         items(sorted, key = { it.name }) { book ->
             BookCard(
                 book = book,
+                rank = ranks.getValue(book.name),
+                fraction = bookDurationFraction(book.totalMs, maxMs),
                 expanded = book.name in expanded,
                 mergeMode = mergeMode,
                 onToggle = { expanded = if (book.name in expanded) expanded - book.name else expanded + book.name },
@@ -174,6 +184,8 @@ fun BooksPage(mergeMode: Boolean, bottomPadding: Dp) {
 @Composable
 private fun BookCard(
     book: Book,
+    rank: Int,
+    fraction: Float,
     expanded: Boolean,
     mergeMode: Boolean,
     onToggle: () -> Unit,
@@ -181,6 +193,8 @@ private fun BookCard(
     onSplit: (String) -> Unit,
     onEditNote: () -> Unit,
 ) {
+    var visibleRanges by remember(book.name) { mutableIntStateOf(30) }
+    val displayRanges = remember(book.ranges) { Books.displayRanges(book.ranges) }
     Panel(Modifier.fillMaxWidth()) {
         Column(
             Modifier
@@ -188,31 +202,53 @@ private fun BookCard(
                 .animateContentSize()
                 .padding(16.dp)
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        book.name,
-                        style = MaterialTheme.typography.titleMedium,
-                        maxLines = if (expanded) Int.MAX_VALUE else 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Text(
-                        buildString {
-                            append("最近 ").append(relativeTime(book.lastMs))
-                            append(" · 收听 ").append(book.sessionCount).append(" 次")
-                            if (book.titles.size > 1) append(" · 含 ${book.titles.size} 个标题")
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    book.name,
+                    style = MaterialTheme.typography.titleMedium,
+                    textAlign = TextAlign.Start,
+                    modifier = Modifier.weight(1f),
+                )
                 Spacer(Modifier.width(12.dp))
-                Column(horizontalAlignment = Alignment.End) {
-                    Text(formatDuration(book.totalMs), fontWeight = FontWeight.Bold)
-                    if (mergeMode) {
-                        TextButton(onClick = onMerge) { Text("合并到…") }
-                    }
+                Text(formatDuration(book.totalMs), fontWeight = FontWeight.Bold, softWrap = false)
+            }
+            Spacer(Modifier.height(8.dp))
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .height(4.dp)
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(QQ_BROWSER_BLUE.copy(alpha = 0.2f))
+            ) {
+                Box(
+                    Modifier
+                        .fillMaxWidth(fraction)
+                        .height(4.dp)
+                        .background(QQ_BROWSER_BLUE)
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    buildString {
+                        append("最近 ").append(relativeTime(book.lastMs))
+                        append(" · 收听 ").append(book.sessionCount).append(" 次")
+                        if (book.titles.size > 1) append(" · 含 ${book.titles.size} 个标题")
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+                if (mergeMode) {
+                    TextButton(onClick = onMerge) { Text("合并到…") }
                 }
+                Text(
+                    "NO.$rank",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    softWrap = false,
+                    modifier = Modifier.padding(start = 8.dp),
+                )
             }
 
             if (expanded) {
@@ -220,9 +256,9 @@ private fun BookCard(
                 SectionLabel("收听记录")
                 // 记录跨年或不在今年时，按年份分段并单独写一行年份
                 val thisYear = LocalDate.now().year
-                val showYears = book.ranges.any { it.end.year != thisYear || it.start.year != it.end.year }
+                val showYears = displayRanges.any { it.end.year != thisYear || it.start.year != it.end.year }
                 var lastYear: Int? = null
-                book.ranges.forEach { r ->
+                displayRanges.take(visibleRanges).forEach { r ->
                     if (showYears && r.end.year != lastYear) {
                         Text(
                             "${r.end.year}年",
@@ -233,8 +269,13 @@ private fun BookCard(
                         lastYear = r.end.year
                     }
                     Row(Modifier.padding(vertical = 2.dp)) {
-                        Text(rangeText(r), style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+                        Text(listenRangeText(r), style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f).padding(end = 8.dp))
                         Text(formatDuration(r.ms), style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+                if (displayRanges.size > visibleRanges) {
+                    TextButton(onClick = { visibleRanges += 30 }) {
+                        Text("更多记录（剩余 ${displayRanges.size - visibleRanges} 段）")
                     }
                 }
 
@@ -275,17 +316,19 @@ private fun BookCard(
     }
 }
 
+internal fun bookDurationFraction(totalMs: Long, maxMs: Long): Float =
+    (totalMs.coerceAtLeast(0).toDouble() / maxMs.coerceAtLeast(1)).toFloat().coerceIn(0f, 1f)
+
 @Composable
 private fun SectionLabel(text: String) {
     Text(text, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
 }
 
-/** 单日写「11月3日」，连续多日写「11月3日–11月9日」；跨年的起始日带上年份 */
-private fun rangeText(r: ListenRange): String {
-    val md = DateTimeFormatter.ofPattern("M月d日")
-    if (r.start == r.end) return r.start.format(md)
-    val start = if (r.start.year != r.end.year) r.start.format(DateTimeFormatter.ofPattern("yyyy年M月d日")) else r.start.format(md)
-    return "$start–${r.end.format(md)}"
+internal fun listenRangeText(r: ListenRange): String {
+    val dateTime = DateTimeFormatter.ofPattern(
+        if (r.start.year != r.end.year) "yyyy年M月d日 HH:mm" else "M月d日 HH:mm"
+    )
+    return "${r.start.format(dateTime)} - ${r.end.format(dateTime)}"
 }
 
 @Composable
@@ -361,7 +404,7 @@ private fun MergeSheet(source: Book, candidates: List<Book>, onDismiss: () -> Un
     }
 }
 
-private fun relativeTime(ms: Long): String {
+internal fun relativeTime(ms: Long): String {
     val t = Instant.ofEpochMilli(ms).atZone(ZoneId.systemDefault())
     val today = LocalDate.now()
     val hm = t.format(DateTimeFormatter.ofPattern("HH:mm"))

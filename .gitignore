@@ -9,3 +9,6 @@ _reference/
 # 公开仓库不上传：签名文件、打包产物
 signing/
 apk/
+
+# 本机导出的个人播放历史
+/audio_stats_*.csv

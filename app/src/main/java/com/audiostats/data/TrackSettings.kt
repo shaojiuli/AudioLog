@@ -28,10 +28,28 @@ class TrackSettings(context: Context) {
         get() = prefs.getBoolean(KEY_HIDE_SHORT, true)
         set(v) = prefs.edit().putBoolean(KEY_HIDE_SHORT, v).apply()
 
+    var shortRecordFilterEnabled: Boolean
+        get() = prefs.getBoolean(KEY_SHORT_FILTER_ENABLED, true)
+        set(v) = prefs.edit().putBoolean(KEY_SHORT_FILTER_ENABLED, v).apply()
+
+    var shortRecordFilterSeconds: Int
+        get() = prefs.getInt(KEY_SHORT_FILTER_SECONDS, 5).coerceAtLeast(1)
+        set(v) {
+            require(v > 0)
+            prefs.edit().putInt(KEY_SHORT_FILTER_SECONDS, v).apply()
+        }
+
+    val shortRecordThresholdMs: Long
+        get() = if (shortRecordFilterEnabled) shortRecordFilterSeconds * 1_000L else 0L
+
     /** 媒体音量为 0 时仍计时；关闭后静音期间暂停计时 */
     var countWhenMuted: Boolean
         get() = prefs.getBoolean(KEY_COUNT_MUTED, true)
         set(v) = prefs.edit().putBoolean(KEY_COUNT_MUTED, v).apply()
+
+    var debugPlayback: Boolean
+        get() = prefs.getBoolean(KEY_DEBUG, false)
+        set(v) = prefs.edit().putBoolean(KEY_DEBUG, v).apply()
 
     var showSongsPage: Boolean
         get() = prefs.getBoolean(KEY_SHOW_SONGS, true)
@@ -52,7 +70,10 @@ class TrackSettings(context: Context) {
     companion object {
         const val KEY_ALLOWED = "allowed_packages"
         const val KEY_HIDE_SHORT = "hide_short_records"
+        const val KEY_SHORT_FILTER_ENABLED = "short_record_filter_enabled"
+        const val KEY_SHORT_FILTER_SECONDS = "short_record_filter_seconds"
         const val KEY_COUNT_MUTED = "count_when_muted"
+        const val KEY_DEBUG = "debug_playback"
         const val KEY_APPS_COLLAPSED = "apps_collapsed"
         const val KEY_SHOW_SONGS = "show_songs_page"
         const val KEY_SHOW_BOOKS = "show_books_page"

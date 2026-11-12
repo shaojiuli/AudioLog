@@ -12,13 +12,13 @@ import java.util.zip.ZipOutputStream
 
 /**
  * 完整备份：一个 zip，里面是数据库文件和封面图片（art/ 目录）。
- * 导入时把备份合并进当前数据（重复的跳过），不会覆盖或删除现有记录。
+ * 导入时覆盖匹配记录的信息，新增未匹配记录；不删除备份以外的记录。
  */
 object Backup {
     private const val DB_ENTRY = "audio_stats.db"
     private const val ART_PREFIX = "art/"
 
-    data class ImportResult(val segments: Int, val duplicates: Int, val songs: Int, val covers: Int)
+    data class ImportResult(val segments: Int, val updated: Int, val duplicates: Int, val songs: Int, val covers: Int)
 
     fun export(context: Context, out: OutputStream) {
         val db = AudioDb.get(context)
@@ -78,27 +78,31 @@ object Backup {
 
             // 播放记录：旧版本的备份可能没有 media_id 列
             val mediaCol = if (hasColumn("segments", "media_id")) "media_id" else "NULL"
+            val attributionCol = if (hasColumn("segments", "attribution")) "attribution" else "'legacy'"
+            val originalCol = if (hasColumn("segments", "original_info")) "original_info" else "NULL"
             val segments = ArrayList<Segment>()
-            src.rawQuery("SELECT pkg, title, artist, start_ms, end_ms, output, $mediaCol FROM segments", null).use { c ->
+            src.rawQuery("SELECT pkg, title, artist, start_ms, end_ms, output, $mediaCol, $attributionCol, $originalCol FROM segments", null).use { c ->
                 while (c.moveToNext()) {
-                    segments += Segment(0, c.getString(0), c.getString(1), c.getString(2), c.getLong(3), c.getLong(4), c.getString(5), c.getString(6))
+                    segments += Segment(
+                        0, c.getString(0), c.getString(1), c.getString(2), c.getLong(3), c.getLong(4),
+                        c.getString(5), c.getString(6), Attribution.parse(c.getString(7)), c.getString(8)
+                    )
                 }
             }
-            val inserted = audioDb.importSegments(segments)
-
             val dst = audioDb.writableDatabase
+            var imported: AudioDb.ImportResult
             var songs = 0
             var covers = 0
             dst.beginTransaction()
             try {
+                imported = audioDb.importSegments(segments)
                 if (hasTable("media_meta")) {
                     val artDir = SongInfoStore.artDir(context)
                     src.rawQuery("SELECT pkg, media_id, title, artist, album, duration_ms, art_file FROM media_meta", null).use { c ->
                         while (c.moveToNext()) {
                             val art = c.getString(6)
-                            // 封面文件已有同名的就不覆盖
                             val artOk = art != null && File(artIn, art).let { f ->
-                                f.exists() && (File(artDir, art).exists() || f.copyTo(File(artDir, art)).exists().also { covers++ })
+                                f.exists() && f.copyTo(File(artDir, art), overwrite = true).exists().also { covers++ }
                             }
                             val v = ContentValues().apply {
                                 put("pkg", c.getString(0))
@@ -109,7 +113,7 @@ object Backup {
                                 put("duration_ms", c.getLong(5))
                                 put("art_file", if (artOk) art else null)
                             }
-                            if (dst.insertWithOnConflict("media_meta", null, v, SQLiteDatabase.CONFLICT_IGNORE) != -1L) songs++
+                            if (dst.insertWithOnConflict("media_meta", null, v, SQLiteDatabase.CONFLICT_REPLACE) != -1L) songs++
                         }
                     }
                 }
@@ -117,7 +121,7 @@ object Backup {
                     src.rawQuery("SELECT title, book FROM book_alias", null).use { c ->
                         while (c.moveToNext()) {
                             val v = ContentValues().apply { put("title", c.getString(0)); put("book", c.getString(1)) }
-                            dst.insertWithOnConflict("book_alias", null, v, SQLiteDatabase.CONFLICT_IGNORE)
+                            dst.insertWithOnConflict("book_alias", null, v, SQLiteDatabase.CONFLICT_REPLACE)
                         }
                     }
                 }
@@ -125,7 +129,7 @@ object Backup {
                     src.rawQuery("SELECT book, note FROM book_note", null).use { c ->
                         while (c.moveToNext()) {
                             val v = ContentValues().apply { put("book", c.getString(0)); put("note", c.getString(1)) }
-                            dst.insertWithOnConflict("book_note", null, v, SQLiteDatabase.CONFLICT_IGNORE)
+                            dst.insertWithOnConflict("book_note", null, v, SQLiteDatabase.CONFLICT_REPLACE)
                         }
                     }
                 }
@@ -133,7 +137,7 @@ object Backup {
             } finally {
                 dst.endTransaction()
             }
-            return ImportResult(inserted, segments.size - inserted, songs, covers)
+            return ImportResult(imported.inserted, imported.updated, imported.unchanged, songs, covers)
         } finally {
             src.close()
         }

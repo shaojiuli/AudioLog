@@ -62,7 +62,7 @@ private const val PAGE_SIZE = 30
 private const val SONG_LIST_INDEX = 2
 
 @Composable
-fun SongsPage(bottomPadding: Dp) {
+fun SongsPage(bottomPadding: Dp, refreshKey: Int = 0) {
     val context = LocalContext.current
 
     var songs by remember { mutableStateOf<List<Song>?>(null) }
@@ -77,7 +77,7 @@ fun SongsPage(bottomPadding: Dp) {
         onPauseOrDispose { }
     }
 
-    LaunchedEffect(reloadTick) {
+    LaunchedEffect(reloadTick, refreshKey) {
         while (true) {
             songs = withContext(Dispatchers.IO) { Songs.load(context) }
             delay(30_000)

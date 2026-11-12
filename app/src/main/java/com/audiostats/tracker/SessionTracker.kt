@@ -9,8 +9,12 @@ import android.os.Build
 import android.os.Handler
 import android.util.Log
 import com.audiostats.data.AudioDb
+import com.audiostats.data.Attribution
+import com.audiostats.data.Books
+import com.audiostats.data.PlaybackDebugLog
 import com.audiostats.data.SongInfoStore
 import com.audiostats.data.Table
+import org.json.JSONObject
 
 /**
  * 跟踪单个 MediaSession：PLAYING 时开一段记录，暂停/停止/会话销毁时关闭；
@@ -33,20 +37,20 @@ class SessionTracker(
     private var title: String? = null
     private var artist: String? = null
     private var mediaId: String? = null
-    private var playing = false
-    val isPlaying get() = playing
+    private var reportedPlaying = false
+    private var compatibilityPlaying = false
+    val isPlaying get() = reportedPlaying || compatibilityPlaying
+    private val debug = PlaybackDebugLog.get(context)
+    private val attribution get() = if (compatibilityPlaying) Attribution.QQ_COMPAT else Attribution.REPORTED
+    private var segmentAttribution: String? = null
+    internal fun candidate() = PlaybackCandidate(pkg, stateKnown, title, isLocalPlayback(), reportedPlaying)
 
-    /**
-     * 是否上报过 PlaybackState。有的应用（如 QQ 浏览器）注册了会话、给了歌曲信息，
-     * 但 PlaybackState 始终为 null，这类会话由服务根据系统音乐流状态推断是否在播放。
-     */
+    /** Only QQ Browser may use the separate package-scoped compatibility policy. */
     var stateKnown = false
         private set
-    var lastMetaChangeMs = 0L
-        private set
-
     private var segmentId: Long? = null
     private var segmentStart = 0L
+    private val closedParts = ArrayList<Pair<Long, Long>>()
 
     /**
      * 不在记录范围内的应用仍然跟踪播放状态（推断其他会话时要用），只是不写记录。
@@ -56,13 +60,39 @@ class SessionTracker(
         set(value) {
             if (field == value) return
             field = value
-            if (!value) closeSegment() else if (playing) openSegment()
+            if (!value) closeSegment() else if (isPlaying) openSegment()
         }
 
     private val callback = object : MediaController.Callback() {
-        override fun onPlaybackStateChanged(state: PlaybackState?) = onState(state)
-        override fun onMetadataChanged(metadata: MediaMetadata?) = onMeta(metadata)
+        override fun onPlaybackStateChanged(state: PlaybackState?) {
+            debug.session("playback_state", controller, JSONObject()
+                .put("received_state", state?.toString() ?: JSONObject.NULL))
+            onState(state)
+        }
+        override fun onMetadataChanged(metadata: MediaMetadata?) {
+            debug.session("metadata_changed", controller)
+            onMeta(metadata)
+        }
+        override fun onQueueChanged(queue: MutableList<MediaSession.QueueItem>?) {
+            debug.session("queue_changed", controller)
+        }
+        override fun onQueueTitleChanged(title: CharSequence?) {
+            debug.session("queue_title_changed", controller)
+        }
+        override fun onExtrasChanged(extras: android.os.Bundle?) {
+            debug.session("session_extras_changed", controller)
+        }
+        override fun onAudioInfoChanged(info: MediaController.PlaybackInfo) {
+            debug.session("audio_info_changed", controller)
+            if (!isLocalPlayback()) compatibilityPlaying = false
+            onState(controller.playbackState)
+        }
+        override fun onSessionEvent(event: String, extras: android.os.Bundle?) {
+            debug.session("session_event", controller, JSONObject()
+                .put("name", event).put("event_extras", PlaybackDebugLog.bundle(extras)))
+        }
         override fun onSessionDestroyed() {
+            debug.session("session_destroyed", controller)
             release()
             onDestroyed(token)
         }
@@ -72,12 +102,12 @@ class SessionTracker(
         controller.registerCallback(callback, handler)
         onMeta(controller.metadata)
         onState(controller.playbackState)
+        debugSnapshot()
     }
 
     private fun onState(state: PlaybackState?) {
-        if (state == null) return
-        stateKnown = true
-        val nowPlaying = when (state.state) {
+        stateKnown = state != null
+        val nowPlaying = when (state?.state) {
             PlaybackState.STATE_PLAYING -> !isRemotePlayback(state)
             // 缓冲、跳转等过渡状态：保持原状态，不打断也不新开
             PlaybackState.STATE_BUFFERING,
@@ -86,22 +116,27 @@ class SessionTracker(
             PlaybackState.STATE_REWINDING,
             PlaybackState.STATE_SKIPPING_TO_NEXT,
             PlaybackState.STATE_SKIPPING_TO_PREVIOUS,
-            PlaybackState.STATE_SKIPPING_TO_QUEUE_ITEM -> playing
+            PlaybackState.STATE_SKIPPING_TO_QUEUE_ITEM -> reportedPlaying
 
             else -> false
         }
-        // 很多播放器会重复上报同一状态，只在真正变化时处理
-        if (nowPlaying == playing) return
-        playing = nowPlaying
-        if (playing) openSegment() else closeSegment()
+        reportedPlaying = nowPlaying
+        if (stateKnown) compatibilityPlaying = false
+        reconcileSegment()
         onPlayingChanged()
     }
 
-    /** 仅对不上报 PlaybackState 的会话生效 */
-    fun setInferredPlaying(value: Boolean) {
-        if (stateKnown || value == playing) return
-        playing = value
-        if (playing) openSegment() else closeSegment()
+    fun setQqCompatibilityPlaying(value: Boolean) {
+        val next = value && pkg == Books.SOURCE_PKG && !stateKnown &&
+            !title.isNullOrBlank() && isLocalPlayback()
+        if (next == compatibilityPlaying) return
+        compatibilityPlaying = next
+        reconcileSegment()
+    }
+
+    private fun reconcileSegment() {
+        if (!isPlaying || (segmentId != null && segmentAttribution != attribution)) closeSegment()
+        if (isPlaying) openSegment()
     }
 
     private fun onMeta(metadata: MediaMetadata?) {
@@ -114,17 +149,28 @@ class SessionTracker(
         title = newTitle
         artist = newArtist
         mediaId = newMediaId
-        lastMetaChangeMs = System.currentTimeMillis()
 
-        val id = segmentId ?: return
-        if (System.currentTimeMillis() - segmentStart < META_GRACE_MS) {
+        if (compatibilityPlaying && title.isNullOrBlank()) {
+            compatibilityPlaying = false
+            reconcileSegment()
+            onPlayingChanged()
+            return
+        }
+
+        val id = segmentId
+        if (id != null && System.currentTimeMillis() - segmentStart < META_GRACE_MS) {
             // 刚开始播放时信息常常是分几次到达的，直接补到当前这段上
             db.updateMeta(Table.SEGMENTS, id, title, artist, mediaId)
-        } else {
+        } else if (id != null) {
             closeSegment()
             openSegment()
         }
+        onPlayingChanged()
     }
+
+    private fun isLocalPlayback() =
+        controller.playbackInfo?.playbackType != MediaController.PlaybackInfo.PLAYBACK_TYPE_REMOTE &&
+            !(Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && controller.tag.contains("CastMediaSession"))
 
     /** 投屏 / Spotify Connect 等远程播放：声音不是从手机发出的，不计时 */
     private fun isRemotePlayback(state: PlaybackState): Boolean {
@@ -138,18 +184,38 @@ class SessionTracker(
     }
 
     private fun openSegment() {
-        if (!recording) return
+        if (!recording || segmentId != null) return
         segmentStart = System.currentTimeMillis()
-        segmentId = db.open(Table.SEGMENTS, pkg, title, artist, segmentStart, output(), mediaId)
-        Log.i(TAG, "start $pkg ${if (stateKnown) "" else "(inferred) "}$title / $artist")
+        segmentAttribution = attribution
+        segmentId = db.open(Table.SEGMENTS, pkg, title, artist, segmentStart, output(), mediaId, attribution)
+        debug.record("segment_start", JSONObject().put("id", segmentId).put("pkg", pkg)
+            .put("title", title ?: JSONObject.NULL).put("attribution", attribution)
+            .put("start_ms", segmentStart).put("output", output()))
+        Log.i(TAG, "start $pkg ($attribution) $title / $artist")
     }
 
-    private fun closeSegment() {
-        val id = segmentId ?: return
+    private fun closeSegment(endPlayback: Boolean = true) {
+        val id = segmentId
+        if (id == null) {
+            if (endPlayback) finishPlayback()
+            return
+        }
         val end = System.currentTimeMillis()
-        db.close(Table.SEGMENTS, id, segmentStart, end)
+        val kept = db.close(Table.SEGMENTS, id, segmentStart, end, filterShortRecord = false)
+        if (kept) closedParts += id to (end - segmentStart)
+        debug.record("segment_stop", JSONObject().put("id", id).put("pkg", pkg)
+            .put("start_ms", segmentStart).put("end_ms", end).put("attribution", segmentAttribution)
+            .put("kept_before_short_filter", kept).put("playback_ended", endPlayback))
         segmentId = null
+        segmentAttribution = null
+        if (endPlayback) finishPlayback()
         Log.i(TAG, "stop  $pkg ${(end - segmentStart) / 1000}s")
+    }
+
+    private fun finishPlayback() {
+        if (closedParts.isEmpty()) return
+        db.filterFinishedSegments(closedParts.map { it.first }, closedParts.sumOf { it.second })
+        closedParts.clear()
     }
 
     /** 定期把进行中的记录写盘，进程被杀时最多丢一个间隔 */
@@ -157,15 +223,22 @@ class SessionTracker(
         segmentId?.let { db.updateEnd(Table.SEGMENTS, it, System.currentTimeMillis()) }
     }
 
+    fun debugSnapshot() {
+        debug.session("session_snapshot", controller, JSONObject()
+            .put("recording_allowed", recording).put("reported_playing", reportedPlaying)
+            .put("qq_compat_playing", compatibilityPlaying).put("segment_id", segmentId ?: JSONObject.NULL))
+    }
+
     fun splitForOutputChange() {
         if (segmentId == null || !recording) return
-        closeSegment()
+        closeSegment(endPlayback = false)
         openSegment()
     }
 
     fun release() {
         closeSegment()
-        playing = false
+        reportedPlaying = false
+        compatibilityPlaying = false
         controller.unregisterCallback(callback)
     }
 

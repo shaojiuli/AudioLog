@@ -24,9 +24,11 @@ private val BRAND_COLORS = mapOf(
     "com.netease.cloudmusic" to Color(0xFFC20C0C), // 网易云红（App 图标的红）
 )
 
+internal val QQ_BROWSER_BLUE = Color(0xFF3B82F6)
+
 /** 区分度高、明暗主题下都看得清的分类色，不含粉色和红色（留给哔哩哔哩、网易云） */
 private val PALETTE = listOf(
-    Color(0xFF3B82F6), // 蓝
+    QQ_BROWSER_BLUE,
     Color(0xFFF59E0B), // 琥珀
     Color(0xFF10B981), // 绿
     Color(0xFF8B5CF6), // 紫

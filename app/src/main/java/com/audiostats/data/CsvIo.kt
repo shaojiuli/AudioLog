@@ -14,7 +14,7 @@ import java.time.format.DateTimeFormatter
 object CsvIo {
     private val HEADER = listOf(
         "app_name", "pkg", "title", "artist", "start_time", "end_time",
-        "duration_sec", "output", "start_ms", "end_ms", "media_id",
+        "duration_sec", "output", "start_ms", "end_ms", "media_id", "attribution", "original_info",
     )
     private val TIME_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
     private val PARSE_FMTS = listOf(
@@ -24,7 +24,7 @@ object CsvIo {
         DateTimeFormatter.ofPattern("yyyy-M-d H:mm"),
     )
 
-    data class ImportResult(val inserted: Int, val duplicates: Int, val invalid: Int)
+    data class ImportResult(val inserted: Int, val updated: Int, val duplicates: Int, val invalid: Int)
 
     fun export(context: Context): String {
         val pm = context.packageManager
@@ -33,7 +33,8 @@ object CsvIo {
         val sb = StringBuilder(HEADER.joinToString(",")).append('\n')
         for (s in AudioDb.get(context).allSegments()) {
             val label = labels.getOrPut(s.pkg) {
-                runCatching { pm.getApplicationLabel(pm.getApplicationInfo(s.pkg, 0)).toString() }.getOrDefault(s.pkg)
+                if (s.pkg == Attribution.UNKNOWN_PKG) "待归档"
+                else runCatching { pm.getApplicationLabel(pm.getApplicationInfo(s.pkg, 0)).toString() }.getOrDefault(s.pkg)
             }
             val row = listOf(
                 label, s.pkg, s.title, s.artist,
@@ -41,6 +42,7 @@ object CsvIo {
                 Instant.ofEpochMilli(s.endMs).atZone(zone).format(TIME_FMT),
                 ((s.endMs - s.startMs) / 1000).toString(), s.output,
                 s.startMs.toString(), s.endMs.toString(), s.mediaId,
+                s.attribution, s.originalInfo,
             )
             sb.append(row.joinToString(",") { field(it) }).append('\n')
         }
@@ -49,7 +51,7 @@ object CsvIo {
 
     fun import(context: Context, text: String): ImportResult {
         val rows = parse(text.removePrefix("﻿"))
-        if (rows.isEmpty()) return ImportResult(0, 0, 0)
+        if (rows.isEmpty()) return ImportResult(0, 0, 0, 0)
         val header = rows.first().map { it.trim().lowercase() }
         fun col(row: List<String>, name: String) = header.indexOf(name).takeIf { it >= 0 }?.let { row.getOrNull(it) }
 
@@ -73,10 +75,12 @@ object CsvIo {
                 endMs = end,
                 output = col(row, "output")?.ifEmpty { null } ?: "speaker",
                 mediaId = col(row, "media_id")?.trim()?.ifEmpty { null },
+                attribution = Attribution.parse(col(row, "attribution")),
+                originalInfo = col(row, "original_info")?.ifEmpty { null },
             )
         }
-        val inserted = AudioDb.get(context).importSegments(segments)
-        return ImportResult(inserted, segments.size - inserted, invalid)
+        val result = AudioDb.get(context).importSegments(segments)
+        return ImportResult(result.inserted, result.updated, result.unchanged, invalid)
     }
 
     private fun time(ms: String?, readable: String?): Long? {

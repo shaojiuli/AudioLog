@@ -1,11 +1,11 @@
 package com.audiostats.data
 
 import java.time.Instant
-import java.time.LocalDate
+import java.time.LocalDateTime
 import java.time.ZoneId
 
-/** 一段连续收听的日期（单日时 start == end）及这些天的收听总时长 */
-data class ListenRange(val start: LocalDate, val end: LocalDate, val ms: Long)
+/** 一段连续收听的实际起止时间；短暂的设备切换间隙不计入收听时长。 */
+data class ListenRange(val start: LocalDateTime, val end: LocalDateTime, val ms: Long)
 
 /**
  * 听书记录：QQ 浏览器里同一个播放标题算一本书。
@@ -19,7 +19,7 @@ data class Book(
     val totalMs: Long,
     val lastMs: Long,
     val sessionCount: Int,
-    /** 按连续日期合并的收听记录，最新的在前 */
+    /** 按连续播放合并的收听记录，最新的在前 */
     val ranges: List<ListenRange>,
     val note: String?,
 )
@@ -35,31 +35,46 @@ object Books {
             .groupBy { alias[it.title] ?: it.title!! }
             .map { (name, segs) ->
                 val titles = segs.map { it.title!! }.distinct().sortedBy { it != name }
+                val listening = ranges(segs)
                 Book(
                     name = name,
                     titles = titles,
-                    totalMs = segs.sumOf { it.endMs - it.startMs },
+                    totalMs = listening.sumOf { it.ms },
                     lastMs = segs.maxOf { it.endMs },
-                    sessionCount = segs.size,
-                    ranges = ranges(segs),
+                    sessionCount = listening.size,
+                    ranges = listening,
                     note = notes[name],
                 )
             }
     }
 
-    /** 按开始日期汇总每天的收听时长，再把相邻的日期合并成一段 */
+    /** 合并重叠区间和设备切换产生的不足一秒间隙，不再按整天或连续日期折叠。 */
     private fun ranges(segs: List<Segment>): List<ListenRange> {
         val zone = ZoneId.systemDefault()
-        val daily = segs.groupBy { Instant.ofEpochMilli(it.startMs).atZone(zone).toLocalDate() }
-            .mapValues { (_, l) -> l.sumOf { it.endMs - it.startMs } }
-            .toSortedMap()
+        fun local(ms: Long) = Instant.ofEpochMilli(ms).atZone(zone).toLocalDateTime()
         val out = ArrayList<ListenRange>()
-        for ((day, ms) in daily) {
+        var lastEnd = Long.MIN_VALUE
+        for ((start, end) in Stats.union(segs.map { it.startMs to it.endMs })) {
             val last = out.lastOrNull()
-            if (last != null && last.end.plusDays(1) == day) {
-                out[out.size - 1] = last.copy(end = day, ms = last.ms + ms)
+            if (last != null && start - lastEnd <= 1_000L) {
+                out[out.size - 1] = last.copy(end = local(end), ms = last.ms + end - start)
             } else {
-                out += ListenRange(day, day, ms)
+                out += ListenRange(local(start), local(end), end - start)
+            }
+            lastEnd = end
+        }
+        return out.reversed()
+    }
+
+    /** Display only: adjacent calendar days share a row, but gaps add no listening time. */
+    fun displayRanges(ranges: List<ListenRange>): List<ListenRange> {
+        val out = ArrayList<ListenRange>()
+        for (range in ranges.sortedBy { it.start }) {
+            val last = out.lastOrNull()
+            if (last != null && !range.start.toLocalDate().isAfter(last.end.toLocalDate().plusDays(1))) {
+                out[out.lastIndex] = last.copy(end = maxOf(last.end, range.end), ms = last.ms + range.ms)
+            } else {
+                out += range
             }
         }
         return out.reversed()

@@ -26,6 +26,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -68,6 +69,7 @@ fun MainScreen(
     var span by rememberSaveable { mutableStateOf(Span.DAY) }
     var anchor by rememberSaveable { mutableStateOf(LocalDate.now()) }
     var mergeMode by rememberSaveable { mutableStateOf(false) }
+    var dataRevision by remember { mutableIntStateOf(0) }
 
     // 离开书库页时退出合并模式
     LaunchedEffect(current) {
@@ -113,10 +115,11 @@ fun MainScreen(
                     bottomPadding = bottom,
                     onOpenNotificationAccess = onOpenNotificationAccess,
                     onRequestBatteryWhitelist = onRequestBatteryWhitelist,
+                    onArchived = { dataRevision++ },
                 )
 
-                MainPage.SONGS -> SongsPage(bottomPadding = bottom)
-                MainPage.BOOKS -> BooksPage(mergeMode = mergeMode, bottomPadding = bottom)
+                MainPage.SONGS -> SongsPage(bottomPadding = bottom, refreshKey = dataRevision)
+                MainPage.BOOKS -> BooksPage(mergeMode = mergeMode, bottomPadding = bottom, refreshKey = dataRevision)
             }
         }
     }

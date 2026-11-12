@@ -34,6 +34,7 @@ object OutputDetector {
     fun label(output: String) = when (output) {
         WIRED -> "有线耳机"
         BLUETOOTH -> "蓝牙"
+        "mixed" -> "多种连接"
         else -> "外放"
     }
 }

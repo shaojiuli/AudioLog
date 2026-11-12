@@ -19,6 +19,7 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.lifecycleScope
 import com.audiostats.data.Backup
 import com.audiostats.data.CsvIo
+import com.audiostats.data.PlaybackDebugLog
 import com.audiostats.tracker.AudioTrackerService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -52,6 +53,7 @@ class MainActivity : ComponentActivity() {
                         onBack = { page = Page.MAIN },
                         onExportTable = { exportCsv.launch("audio_stats_${LocalDate.now()}.csv") },
                         onExportData = { exportData.launch("audio_stats_backup_${LocalDate.now()}.zip") },
+                        onExportDebug = { exportDebug.launch("audio_stats_debug_${LocalDate.now()}.zip") },
                         onImport = {
                             importData.launch(arrayOf("application/zip", "text/*", "application/vnd.ms-excel", "application/octet-stream"))
                         },
@@ -105,7 +107,19 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** 导入：zip 当作完整备份合并；其他当作导出的 CSV 表格。都只新增，不覆盖现有记录 */
+    private val exportDebug = registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        uri ?: return@registerForActivityResult
+        lifecycleScope.launch {
+            val ok = withContext(Dispatchers.IO) {
+                runCatching {
+                    contentResolver.openOutputStream(uri)!!.use { PlaybackDebugLog.get(this@MainActivity).export(it) }
+                }.isSuccess
+            }
+            toast(if (ok) "调试日志已导出" else "调试日志导出失败")
+        }
+    }
+
+    /** 匹配记录覆盖信息，未匹配的新增；文件以外的记录不删除。 */
     private val importData = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri ?: return@registerForActivityResult
         lifecycleScope.launch {
@@ -116,16 +130,16 @@ class MainActivity : ComponentActivity() {
                     if (isZip) {
                         val r = Backup.import(this@MainActivity, bytes.inputStream())
                         buildString {
-                            append("导入 ${r.segments} 条记录")
-                            if (r.duplicates > 0) append("，跳过重复 ${r.duplicates} 条")
+                            append("新增 ${r.segments} 条，覆盖 ${r.updated} 条")
+                            if (r.duplicates > 0) append("，未变 ${r.duplicates} 条")
                             if (r.songs > 0) append("，歌曲信息 ${r.songs} 首")
                             if (r.covers > 0) append("，封面 ${r.covers} 张")
                         }
                     } else {
                         val r = CsvIo.import(this@MainActivity, bytes.toString(Charsets.UTF_8))
                         buildString {
-                            append("导入 ${r.inserted} 条")
-                            if (r.duplicates > 0) append("，跳过重复 ${r.duplicates} 条")
+                            append("新增 ${r.inserted} 条，覆盖 ${r.updated} 条")
+                            if (r.duplicates > 0) append("，未变 ${r.duplicates} 条")
                             if (r.invalid > 0) append("，无法识别 ${r.invalid} 行")
                         }
                     }

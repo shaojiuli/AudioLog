@@ -79,7 +79,8 @@ object Stats {
         val (first, last) = dateRange(span, anchor)
         val from = startOf(first)
         val to = startOf(last.plusDays(1))
-        val clipped = db.overlapping(Table.SEGMENTS, from, to).map { it.clip(from, to) }
+        val tracks = db.overlapping(Table.SEGMENTS, from, to)
+        val clipped = tracks.map { it.clip(from, to) }
 
         val apps = clipped.groupBy { it.pkg }
             .map { (pkg, list) -> AppUsage(pkg, length(union(list.map { it.startMs to it.endMs })), list.size) }
@@ -104,7 +105,7 @@ object Stats {
             buckets = buckets(span, first, last, chartUnion, partUnions),
             parts = partUnions.map { (k, u) -> k to length(u) }.sortedByDescending { it.second },
             partsAreBooks = byBook,
-            tracks = clipped.sortedByDescending { it.startMs },
+            tracks = tracks.sortedByDescending { it.startMs },
         )
     }
 

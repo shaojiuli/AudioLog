@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.os.PowerManager
+import android.widget.Toast
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -11,6 +12,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -22,6 +24,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -47,6 +50,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -67,6 +71,8 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -75,7 +81,9 @@ import androidx.compose.ui.unit.sp
 import androidx.core.graphics.drawable.toBitmap
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import com.audiostats.data.AudioDb
+import com.audiostats.data.Attribution
 import com.audiostats.data.Bucket
+import com.audiostats.data.Books
 import com.audiostats.data.PeriodStats
 import com.audiostats.data.Segment
 import com.audiostats.data.Span
@@ -86,6 +94,7 @@ import com.audiostats.tracker.AudioTrackerService
 import com.audiostats.tracker.OutputDetector
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.time.Instant
 import kotlin.math.ceil
@@ -110,10 +119,13 @@ fun StatsPage(
     bottomPadding: Dp,
     onOpenNotificationAccess: () -> Unit,
     onRequestBatteryWhitelist: () -> Unit,
+    onArchived: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val db = remember { AudioDb.get(context) }
     val settings = remember { TrackSettings(context) }
+    val scope = rememberCoroutineScope()
+    var archiveTarget by remember { mutableStateOf<Segment?>(null) }
 
     var stats by remember { mutableStateOf<PeriodStats?>(null) }
     var selectedPkg by rememberSaveable { mutableStateOf<String?>(null) }
@@ -271,7 +283,10 @@ fun StatsPage(
         val tracks = s.tracks
             .filter { selected == null || it.pkg == selected }
             // 进行中的记录每 30 秒写盘一次，end 距今不久的视为仍在播放，先显示
-            .filter { !hideShort || it.endMs - it.startMs >= 60_000 || now - it.endMs < 45_000 }
+            .filter {
+                it.attribution == Attribution.UNCONFIRMED ||
+                    !hideShort || it.endMs - it.startMs >= 60_000 || now - it.endMs < 45_000
+            }
 
         item {
             SectionHeader(
@@ -296,7 +311,14 @@ fun StatsPage(
         items(groupTracks(tracks.take(MAX_TRACKS)), key = { it.first().id }) { group ->
             val pkg = group.first().pkg
             Box(Modifier.padding(bottom = ITEM_GAP)) {
-                TrackGroup(group, appInfos[pkg]?.label ?: pkg, showDate = span != Span.DAY)
+                TrackGroup(
+                    group, appInfos[pkg]?.label ?: pkg, showDate = span != Span.DAY,
+                    onArchive = { seg ->
+                        scope.launch {
+                            archiveTarget = withContext(Dispatchers.IO) { db.segment(seg.id) }
+                        }
+                    },
+                )
             }
         }
         if (tracks.size > MAX_TRACKS) {
@@ -308,6 +330,19 @@ fun StatsPage(
                 )
             }
         }
+    }
+
+    archiveTarget?.let { segment ->
+        ArchiveBookSheet(
+            segment = segment,
+            onDismiss = { archiveTarget = null },
+            onSaved = {
+                archiveTarget = null
+                refreshTick++
+                onArchived()
+                Toast.makeText(context, "已归档", Toast.LENGTH_SHORT).show()
+            },
+        )
     }
 }
 
@@ -655,12 +690,16 @@ private fun AppRow(info: AppInfo, totalMs: Long, fraction: Float, color: Color, 
     }
 }
 
-/** 连续的同一应用、同一标题的记录归为一组，标题只显示一次 */
-private fun groupTracks(tracks: List<Segment>): List<List<Segment>> {
+/** QQ 小说只按连续的同应用、同书名分组；其他应用还须艺术家和识别来源一致。 */
+internal fun groupTracks(tracks: List<Segment>): List<List<Segment>> {
     val groups = ArrayList<MutableList<Segment>>()
     for (seg in tracks) {
         val last = groups.lastOrNull()?.first()
-        if (last != null && last.pkg == seg.pkg && last.title == seg.title && last.artist == seg.artist) {
+        if (last != null && last.pkg != Attribution.UNKNOWN_PKG &&
+            last.pkg == seg.pkg && last.title == seg.title &&
+            (if (seg.pkg == Books.SOURCE_PKG) !seg.title.isNullOrBlank()
+             else last.artist == seg.artist && last.attribution == seg.attribution)
+        ) {
             groups.last() += seg
         } else {
             groups += mutableListOf(seg)
@@ -671,45 +710,91 @@ private fun groupTracks(tracks: List<Segment>): List<List<Segment>> {
 
 /**
  * 一组记录放在一个背景框里：标题一行；下面每次播放一行（时间段、时长、连接方式），
- * 连接方式只在和上一行不同时显示；应用名在第一条播放行的最右侧。
+ * 连接方式只在和上一行不同时显示；应用名在第一行播放记录最右侧。
  */
 @Composable
-private fun TrackGroup(group: List<Segment>, appLabel: String, showDate: Boolean) {
-    val zone = ZoneId.systemDefault()
-    val startFmt = DateTimeFormatter.ofPattern(if (showDate) "M-d HH:mm" else "HH:mm")
-    val endFmt = DateTimeFormatter.ofPattern("HH:mm")
+private fun TrackGroup(group: List<Segment>, appLabel: String, showDate: Boolean, onArchive: (Segment) -> Unit) {
     val first = group.first()
     val sub = MaterialTheme.typography.bodySmall
     val subColor = MaterialTheme.colorScheme.onSurfaceVariant
 
     Panel(Modifier.fillMaxWidth()) { Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
         Text(
-            listOfNotNull(first.title, first.artist).joinToString(" — ").ifEmpty { "（无标题）" },
+            playbackRecordTitle(first),
             style = MaterialTheme.typography.bodyLarge,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.fillMaxWidth(),
         )
         var prevOutput: String? = null
-        group.forEachIndexed { i, seg ->
-            val start = Instant.ofEpochMilli(seg.startMs).atZone(zone).format(startFmt)
-            val end = Instant.ofEpochMilli(seg.endMs).atZone(zone).format(endFmt)
-            Row(Modifier.padding(top = 2.dp)) {
-                Text("$start–$end", style = sub, color = subColor, modifier = Modifier.width(if (showDate) 128.dp else 96.dp))
-                Text(formatDuration(seg.endMs - seg.startMs), style = sub, color = subColor, modifier = Modifier.width(72.dp))
-                Text(
-                    if (seg.output != prevOutput) OutputDetector.label(seg.output) else "",
-                    style = sub,
-                    color = subColor,
+        group.forEachIndexed { index, seg ->
+            Row(Modifier.fillMaxWidth().padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                PlaybackRecordLine(
+                    playbackRecordText(seg, showDate, seg.output != prevOutput),
+                    style = sub.copy(color = subColor),
                     modifier = Modifier.weight(1f),
                 )
-                if (i == 0) Text(appLabel, style = sub, color = subColor, maxLines = 1)
+                if (seg.attribution == Attribution.UNCONFIRMED && seg.pkg == Attribution.UNKNOWN_PKG) {
+                    TextButton(
+                        onClick = { onArchive(seg) },
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                        modifier = Modifier.height(36.dp),
+                    ) { Text("归档") }
+                }
+                if (index == 0) {
+                    Text(
+                        appLabel, style = sub, color = subColor, maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(start = 8.dp).widthIn(max = 80.dp),
+                    )
+                }
             }
             prevOutput = seg.output
         }
     } }
 }
 
+internal fun playbackRecordTitle(segment: Segment): String = when (segment.pkg) {
+    Attribution.UNKNOWN_PKG -> "待确认音频"
+    Books.SOURCE_PKG -> segment.title?.takeIf { it.isNotBlank() } ?: "（无标题）"
+    else -> listOfNotNull(segment.title, segment.artist).filter { it.isNotBlank() }
+        .joinToString(" — ").ifEmpty { "（无标题）" }
+}
+
+internal fun playbackRecordText(
+    segment: Segment,
+    showDate: Boolean,
+    showOutput: Boolean,
+    zone: ZoneId = ZoneId.systemDefault(),
+): String {
+    val start = Instant.ofEpochMilli(segment.startMs).atZone(zone)
+    val end = Instant.ofEpochMilli(segment.endMs).atZone(zone)
+    val crossesDate = start.toLocalDate() != end.toLocalDate()
+    val from = start.format(DateTimeFormatter.ofPattern(if (showDate || crossesDate) "M-d HH:mm" else "HH:mm"))
+    val to = end.format(DateTimeFormatter.ofPattern(if (crossesDate) "M-d HH:mm" else "HH:mm"))
+    return buildString {
+        append("$from–$to · ").append(formatDuration(segment.endMs - segment.startMs))
+        if (segment.pkg != Attribution.UNKNOWN_PKG && showOutput)
+            append(" · ").append(OutputDetector.label(segment.output))
+        if (segment.attribution == Attribution.MANUAL) append(" · 已归档")
+    }
+}
+
+@Composable
+private fun PlaybackRecordLine(text: String, style: TextStyle, modifier: Modifier = Modifier) {
+    val measurer = rememberTextMeasurer()
+    BoxWithConstraints(modifier) {
+        val fittedStyle = remember(measurer, text, style, constraints.maxWidth) {
+            val width = measurer.measure(text, style = style, softWrap = false, maxLines = 1).size.width
+            val scale = ((constraints.maxWidth - 1).coerceAtLeast(1).toFloat() / width.coerceAtLeast(1)).coerceAtMost(1f)
+            style.copy(fontSize = (style.fontSize.value * scale).sp)
+        }
+        Text(text, style = fittedStyle, maxLines = 1, softWrap = false)
+    }
+}
+
 private fun loadAppInfo(context: Context, pkg: String): AppInfo {
+    if (pkg == Attribution.UNKNOWN_PKG) return AppInfo("待归档", null)
     val pm = context.packageManager
     return try {
         val ai = pm.getApplicationInfo(pkg, 0)

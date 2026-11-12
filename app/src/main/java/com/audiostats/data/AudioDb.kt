@@ -6,6 +6,7 @@ import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import java.io.File
+import org.json.JSONObject
 
 /**
  * 一段连续的播放记录。
@@ -22,6 +23,8 @@ data class Segment(
     val output: String,
     /** 播放器给的媒体 ID（网易云是歌曲 ID）；旧记录和不提供的应用为空 */
     val mediaId: String? = null,
+    val attribution: String = Attribution.LEGACY,
+    val originalInfo: String? = null,
 )
 
 /**
@@ -41,9 +44,10 @@ data class SongMeta(
 enum class Table(val sqlName: String) { SEGMENTS("segments"), ACTIVITY("activity") }
 
 class AudioDb private constructor(context: Context) :
-    SQLiteOpenHelper(context.applicationContext, "audio_stats.db", null, 6) {
+    SQLiteOpenHelper(context.applicationContext, "audio_stats.db", null, 7) {
 
     private val appContext = context.applicationContext
+    private val settings by lazy { TrackSettings(appContext) }
 
     init {
         setWriteAheadLoggingEnabled(true)
@@ -60,7 +64,9 @@ class AudioDb private constructor(context: Context) :
                     start_ms INTEGER NOT NULL,
                     end_ms INTEGER NOT NULL,
                     output TEXT NOT NULL,
-                    media_id TEXT
+                    media_id TEXT,
+                    attribution TEXT NOT NULL DEFAULT 'legacy',
+                    original_info TEXT
                 )"""
             )
             db.execSQL("CREATE INDEX idx_${t.sqlName}_start ON ${t.sqlName}(start_ms)")
@@ -94,6 +100,12 @@ class AudioDb private constructor(context: Context) :
             )
         }
         db.execSQL("DROP TABLE IF EXISTS song_meta")
+        if (oldVersion < 7) {
+            for (t in Table.entries) {
+                db.execSQL("ALTER TABLE ${t.sqlName} ADD COLUMN attribution TEXT NOT NULL DEFAULT 'legacy'")
+                db.execSQL("ALTER TABLE ${t.sqlName} ADD COLUMN original_info TEXT")
+            }
+        }
     }
 
     /** 听书合并：把某个播放标题归到另一本书（书名即目标书的标题） */
@@ -212,7 +224,7 @@ class AudioDb private constructor(context: Context) :
         }
     }
 
-    private val segmentColumns = "id, pkg, title, artist, start_ms, end_ms, output, media_id"
+    private val segmentColumns = "id, pkg, title, artist, start_ms, end_ms, output, media_id, attribution, original_info"
 
     private fun Cursor.toSegment() = Segment(
         id = getLong(0),
@@ -223,7 +235,44 @@ class AudioDb private constructor(context: Context) :
         endMs = getLong(5),
         output = getString(6),
         mediaId = getString(7),
+        attribution = getString(8),
+        originalInfo = getString(9),
     )
+
+    fun segment(id: Long): Segment? =
+        readableDatabase.rawQuery(
+            "SELECT $segmentColumns FROM segments WHERE id = ?", arrayOf(id.toString())
+        ).use { if (it.moveToFirst()) it.toSegment() else null }
+
+    /** 只更正归属，不新增时长；第一次更正前的信息随备份和表格保留。 */
+    fun archiveSegment(id: Long, bookName: String): Boolean {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val current = segment(id) ?: return false
+            require(Books.load(this).any { it.name == bookName }) { "目标小说已不存在，请重新选择" }
+            val original = current.originalInfo ?: JSONObject().apply {
+                put("pkg", current.pkg)
+                put("title", current.title ?: JSONObject.NULL)
+                put("artist", current.artist ?: JSONObject.NULL)
+                put("media_id", current.mediaId ?: JSONObject.NULL)
+                put("attribution", current.attribution)
+            }.toString()
+            val values = ContentValues().apply {
+                put("pkg", Books.SOURCE_PKG)
+                put("title", bookName)
+                putNull("artist")
+                putNull("media_id")
+                put("attribution", Attribution.MANUAL)
+                put("original_info", original)
+            }
+            val changed = db.update("segments", values, "id = ?", arrayOf(id.toString())) == 1
+            db.setTransactionSuccessful()
+            return changed
+        } finally {
+            db.endTransaction()
+        }
+    }
 
     fun segmentsOf(pkg: String): List<Segment> {
         val result = ArrayList<Segment>()
@@ -240,6 +289,7 @@ class AudioDb private constructor(context: Context) :
     fun open(
         table: Table, pkg: String, title: String?, artist: String?, startMs: Long, output: String,
         mediaId: String? = null,
+        attribution: String = Attribution.REPORTED,
     ): Long {
         val v = ContentValues().apply {
             put("pkg", pkg)
@@ -249,6 +299,7 @@ class AudioDb private constructor(context: Context) :
             put("end_ms", startMs)
             put("output", output)
             put("media_id", mediaId)
+            put("attribution", attribution)
         }
         return writableDatabase.insert(table.sqlName, null, v)
     }
@@ -258,22 +309,62 @@ class AudioDb private constructor(context: Context) :
         writableDatabase.update(table.sqlName, v, "id = ?", arrayOf(id.toString()))
     }
 
+    fun markOutputChange(id: Long, output: String) {
+        writableDatabase.execSQL(
+            "UPDATE segments SET output = CASE WHEN output = ? THEN output ELSE 'mixed' END WHERE id = ?",
+            arrayOf(output, id)
+        )
+    }
+
     fun updateMeta(table: Table, id: Long, title: String?, artist: String?, mediaId: String?) {
         val v = ContentValues().apply {
             put("title", title)
             put("artist", artist)
             put("media_id", mediaId)
         }
-        writableDatabase.update(table.sqlName, v, "id = ?", arrayOf(id.toString()))
+        writableDatabase.update(
+            table.sqlName, v, "id = ? AND attribution != ?",
+            arrayOf(id.toString(), Attribution.MANUAL)
+        )
     }
 
-    /** 结束一段记录；太短的（误触、切歌瞬间的状态抖动）直接删掉 */
-    fun close(table: Table, id: Long, startMs: Long, endMs: Long) {
-        if (endMs - startMs < MIN_SEGMENT_MS) {
+    /** Apply destructive short-record filtering only at close, never to checkpointed or imported data. */
+    fun close(
+        table: Table, id: Long, startMs: Long, endMs: Long, filterShortRecord: Boolean = true,
+    ): Boolean {
+        val duration = endMs - startMs
+        if (table == Table.SEGMENTS && duration > 0) {
+            updateEnd(table, id, endMs)
+            return !filterShortRecord || filterFinishedSegments(listOf(id), duration)
+        }
+        val threshold = if (table == Table.ACTIVITY) MIN_SEGMENT_MS else 0L
+        val keep = duration > 0 && duration >= threshold
+        if (!keep) {
             writableDatabase.delete(table.sqlName, "id = ?", arrayOf(id.toString()))
+            PlaybackDebugLog.get(appContext).record("short_record_deleted", JSONObject()
+                .put("table", table.sqlName).put("id", id).put("duration_ms", duration)
+                .put("threshold_ms", threshold))
         } else {
             updateEnd(table, id, endMs)
         }
+        return keep
+    }
+
+    /** Output-device splits belong to one playback; do not filter them independently. */
+    internal fun filterFinishedSegments(ids: List<Long>, durationMs: Long): Boolean {
+        if (durationMs > 0 && durationMs >= settings.shortRecordThresholdMs) return true
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            ids.forEach { db.delete(Table.SEGMENTS.sqlName, "id = ?", arrayOf(it.toString())) }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        PlaybackDebugLog.get(appContext).record("short_record_deleted", JSONObject()
+            .put("table", Table.SEGMENTS.sqlName).put("ids", org.json.JSONArray(ids))
+            .put("duration_ms", durationMs).put("threshold_ms", settings.shortRecordThresholdMs))
+        return false
     }
 
     /** 查询与 [fromMs, toMs) 有交集的记录 */
@@ -290,18 +381,36 @@ class AudioDb private constructor(context: Context) :
 
     fun allSegments(): List<Segment> = overlapping(Table.SEGMENTS, Long.MIN_VALUE, Long.MAX_VALUE)
 
-    /** 批量导入，同一应用同一开始时间的记录视为重复跳过；返回实际插入条数 */
-    fun importSegments(segments: List<Segment>): Int {
+    data class ImportResult(val inserted: Int, val updated: Int, val unchanged: Int)
+
+    /** 匹配记录原地覆盖；归档改过应用时，优先按保留的原应用和开始时间定位。 */
+    fun importSegments(segments: List<Segment>): ImportResult {
         val db = writableDatabase
         var inserted = 0
+        var updated = 0
+        var unchanged = 0
         db.beginTransaction()
         try {
             for (s in segments) {
-                val exists = db.rawQuery(
-                    "SELECT 1 FROM segments WHERE pkg = ? AND start_ms = ? LIMIT 1",
-                    arrayOf(s.pkg, s.startMs.toString())
-                ).use { it.moveToFirst() }
-                if (exists) continue
+                val originalPkg = s.originalInfo?.let {
+                    runCatching { JSONObject(it).optString("pkg").takeIf(String::isNotBlank) }.getOrNull()
+                }
+                var current: Segment? = null
+                for (pkg in listOfNotNull(originalPkg, s.pkg).distinct()) {
+                    val matches = db.rawQuery(
+                        "SELECT $segmentColumns FROM segments WHERE pkg = ? AND start_ms = ?",
+                        arrayOf(pkg, s.startMs.toString()),
+                    ).use { c -> buildList { while (c.moveToNext()) add(c.toSegment()) } }
+                    require(matches.size <= 1) { "同一应用存在多条相同开始时间的记录，无法安全覆盖" }
+                    if (matches.isNotEmpty()) {
+                        current = matches.single()
+                        break
+                    }
+                }
+                if (current != null && current.copy(id = 0) == s.copy(id = 0)) {
+                    unchanged++
+                    continue
+                }
                 val v = ContentValues().apply {
                     put("pkg", s.pkg)
                     put("title", s.title)
@@ -310,15 +419,22 @@ class AudioDb private constructor(context: Context) :
                     put("end_ms", s.endMs)
                     put("output", s.output)
                     put("media_id", s.mediaId)
+                    put("attribution", s.attribution)
+                    put("original_info", s.originalInfo)
                 }
-                db.insert(Table.SEGMENTS.sqlName, null, v)
-                inserted++
+                if (current == null) {
+                    db.insertOrThrow(Table.SEGMENTS.sqlName, null, v)
+                    inserted++
+                } else {
+                    check(db.update(Table.SEGMENTS.sqlName, v, "id = ?", arrayOf(current.id.toString())) == 1)
+                    updated++
+                }
             }
             db.setTransactionSuccessful()
         } finally {
             db.endTransaction()
         }
-        return inserted
+        return ImportResult(inserted, updated, unchanged)
     }
 
     companion object {

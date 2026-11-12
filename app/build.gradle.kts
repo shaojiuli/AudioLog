@@ -12,8 +12,9 @@ android {
         applicationId = "com.audiostats"
         minSdk = 26
         targetSdk = 35
-        versionCode = 24
-        versionName = "1.23"
+        versionCode = 33
+        versionName = "1.32"
+        testInstrumentationRunner = "com.audiostats.VerificationInstrumentation"
     }
 
     signingConfigs {
@@ -45,6 +46,14 @@ android {
     buildFeatures {
         compose = true
     }
+    testOptions {
+        unitTests.all {
+            it.jvmArgs("--add-opens=java.base/java.lang=ALL-UNNAMED")
+            System.getProperty("robolectric.dependency.repo.url")?.let { url ->
+                it.systemProperty("robolectric.dependency.repo.url", url)
+            }
+        }
+    }
 }
 
 dependencies {
@@ -56,6 +65,8 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.14.1")
 }
 
 // 每次打包后另存一份带版本号的 APK 到项目 apk/ 目录，方便找到和发到手机
